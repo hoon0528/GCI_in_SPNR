@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric import utils as pyg_utils
 
 from torch_geometric.nn import MessagePassing
 from SourceModified.message_passing import MessagePassing2
@@ -55,8 +56,9 @@ class gts_adj_inf(MessagePassing2):
         self.bn_h = nn.BatchNorm1d(n_hid)
 
         self.fc_conv_h = nn.Linear(self.convh_dim, n_hid)
+        self.fc_conx_h = nn.Linear(self.convx_dim * out_channel, n_hid)
         self.fc_cat = nn.Linear(2*n_hid, n_hid)
-        self.fc_out_adj = nn.Linear(n_hid, 2)
+        self.fc_out_adj = nn.Linear(n_hid, 2) # [nodes, nodes, 2]
         self.fc_out_corr = nn.Linear(n_hid, 1)
         
         self.fc_e2n = nn.Linear(n_hid, n_hid)
@@ -70,26 +72,30 @@ class gts_adj_inf(MessagePassing2):
                 nn.init.xavier_normal_(m.weight.data)
                 m.bias.data.fill_(0.1)
 
-    def forward(self, inputs, edge_index):
+    def forward(self, inputs, edge_index, double_conv_layer=False):
         # Eq 5
         x = inputs.reshape(self.nodes, 1, -1)
         x = self.conv_x(x) # [sims * nodes, hid_dim]
         x = F.relu(x)
         x = self.bn_conv_x(x)
 
-        x = self.conv_h(x)
-        x = F.relu(x)
-        x = self.bn_conv_h(x)
-        x = x.reshape(self.nodes, -1)
+        if double_conv_layer:
+            x = self.conv_h(x)
+            x = F.relu(x)
+            x = self.bn_conv_h(x)
+            x = x.reshape(self.nodes, -1)
+            x = self.fc_conv_h(x)
 
-        x = self.fc_conv_h(x)
-        x = F.relu(x)
+        else:
+            x = x.reshape(self.nodes, -1)
+            x = self.fc_conx_h(x)
+            x = F.relu(x)
+        
         x = self.bn_h(x)
 
         _, x_e = self.propagate(edge_index, x=x)
-        x_adj = self.fc_out_adj(x_e)
         x_corr = self.fc_out_corr(x_e)
-        return x_adj, x_corr
+        return x, x_corr
             
     def message(self, x_i, x_j):
         x_edge = torch.cat([x_i, x_j], dim=-1)
@@ -161,8 +167,59 @@ class gts_adj_inf_cs(MessagePassing2):
         new_embedding = self.fc_e2n(aggr_out)
         return new_embedding
 
+class gts_adj_selfattention(nn.Module):
+    """ GTS style structure inference model using Pytorch Geometric """
+    def __init__(self, n_nodes, n_hid, out_channel, ks_x, ks_h, st_x, st_h, total_steps):
+        super(gts_adj_selfattention, self).__init__(aggr='add') # Eq 7 aggr part
+        self.conv_x = nn.Conv1d(1, out_channel, ks_x, stride=st_x)
+        self.conv_h = nn.Conv1d(out_channel, 2*out_channel, ks_h, stride=st_h)
+        self.convx_dim = int(((total_steps - ks_x) / st_x) + 1)
+        self.convh_dim = int(((self.convx_dim - ks_h) / st_h) + 1) * out_channel * 2
 
+        self.bn_conv_x = nn.BatchNorm1d(out_channel)
+        self.bn_conv_h = nn.BatchNorm1d(2*out_channel)
+        self.bn_h = nn.BatchNorm1d(n_hid)
 
+        self.fc_conv_h = nn.Linear(self.convh_dim, n_hid)
+        
+        self.fc_k = nn.Linear(n_hid, n_hid)
+        self.fc_q = nn.Linear(n_hid, n_hid)
+
+        self.nodes = n_nodes
+        self.init_weights()
+        self.n_hid = n_hid
+        
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight.data)
+                m.bias.data.fill_(0.1)
+
+    def forward(self, inputs, edge_index):
+        # Eq 5
+        x = inputs.reshape(self.nodes, 1, -1)
+        x = self.conv_x(x) # [sims * nodes, hid_dim]
+        x = F.relu(x)
+        x = self.bn_conv_x(x)
+
+        x = self.conv_h(x)
+        x = F.relu(x)
+        x = self.bn_conv_h(x)
+        x = x.reshape(self.nodes, -1)
+
+        x = self.fc_conv_h(x)
+        x = F.relu(x)
+        x = self.bn_h(x)
+        # Get Query & Key Pairs
+        x_q = self.fc_q(x) #[nodes, hid]
+        x_k = self.fc_k(x)
+
+        x_corr = F.softmax(torch.matmul(x_q, x_k.t()) / self.n_hid, dim=1)
+        x_corr = (x_corr + x_corr.t()) / 2
+        x_sparse = pyg_utils.dense_to_sparse(x_corr)
+        _, x_corr = pyg_utils.remove_self_loops(x_sparse[0], x_sparse[1])
+        return x_corr
+            
 '''device = 'cpu'
 fully_connected = np.ones((10, 10)) - np.eye(10)
 circshift_edge = np.zeros((10, 10))

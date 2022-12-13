@@ -1,3 +1,10 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+.vscode
+.ipynb_checkpoints/
+
 data/
 fig/
 model/backup
@@ -32,3 +39,6 @@ plot_ss_w_pin.py
 plot_ss_wo_pin.py
 plot.py
 git token.txt
+z_pallet.py
+z_pallet_2.py
+

@@ -1,202 +1,16 @@
-from ast import Assert
-from numpy.core.fromnumeric import transpose
+import os
 import torch
 import numpy as np
-import mat73
-from torch.serialization import validate_cuda_device
-from generate_data import *
+
+from tqdm import tqdm
+from generate_spike import *
 from scipy.optimize import minimize
-import generate_spike as gen_spike
-import os
+from model.nri_vsc_wo_pinputs import RNN_DEC_lam, RNN_DEC_log, GNN_ENC_mousehd
+from torch_geometric import utils as pyg_utils
+from torch.utils.data import Dataset, DataLoader
+from model.gts_adj import gts_adj_inf
 
-def nll_gaussian(preds, target, variance, add_const=False):
-    neg_log_p = ((preds - target) ** 2 / (2 * variance))
-    if add_const:
-        const = 0.5 * np.log(2 * np.pi * variance)
-        neg_log_p += const
-    return neg_log_p.sum() / (target.size(0))
-
-def kl_categorical(preds, log_prior, num_nodes, eps=1e-16):
-    num_edges = num_nodes * (num_nodes - 1)
-    kl_div = preds * (torch.log(preds + eps) - log_prior)
-    return kl_div.sum() / preds.size(0) * num_edges
-
-def kl_categorical_uniform(preds, num_nodes, num_edge_types, add_const=False, eps=1e-16):
-    kl_div = preds * torch.log(preds + eps)
-    num_edges = num_nodes * (num_nodes - 1)
-    if add_const:
-        const = np.log(num_edge_types)
-        kl_div += const
-    return kl_div.sum() / preds.size(0) * num_edges # sims * edges
-
-def kl_gaussian(preds_mu, preds_log_var):
-    kl_div = 0.5 * (preds_log_var.exp() + preds_mu**2 - 1 - preds_log_var)
-    return kl_div.sum() / preds_mu.size(0)
-
-def edge_accuracy(preds, target):
-    #preds는 index를 return [#sims, #edges, #edge_types] -> [#sims, #edges] / element -1 dim에서의 max index
-    preds_max = preds.argmax(-1) 
-    correct = preds_max.float().eq(
-        target.float().view_as(preds_max)).cpu().sum()
-    
-    return np.float(correct) / (target.size(0))
-
-# Too slow...
-def edge_accuracy_index(preds, target):
-    edge_types = preds.size(-1)
-    target_size = target.size(0)
-
-    preds = preds.argmax(-1).float().cpu().detach()
-    target = target.float().view_as(preds).cpu().detach().numpy()
-    preds = preds.numpy()
-
-    preds_per = np.zeros_like(preds)
-
-    for i in range(edge_types):
-        idx = np.where(preds == i)
-        permute = np.mean(target[idx] - preds[idx])
-        preds_per[idx] = preds[idx] + np.round(permute, 0)
-
-    correct = np.sum(preds_per == target)
-
-    return correct / target_size
-
-def edge_accuracy_con(preds, target):
-    edge_types = target.size(-1)
-    target_size = target.size(0)
-
-    preds = preds.float().cpu().detach() #continuous value
-    target = target.float().view_as(preds).cpu().detach().numpy()
-    preds = preds.numpy()
-
-    preds_per = np.zeros_like(preds)
-
-    for i in range(edge_types):
-        idx = np.where(preds == i)
-        permute = np.mean(target[idx] - preds[idx])
-        preds_per[idx] = preds[idx] + np.round(permute, 0)
-
-    correct = np.sum(preds_per == target)
-
-    return correct / target_size
-
-def kl_pseudo(u_star, mu_sig, log_spike, mu_sig_p, log_spike_p, n_edges):
-    eps = 1e-10
-    batch_size = u_star.shape[0]
-    T_p = torch.cat((mu_sig_p, log_spike_p), dim=-1).reshape(-1, n_edges, 3)
-    expand_size = [batch_size] + list(T_p.shape)
-    T_p = T_p.unsqueeze(0).expand(expand_size)
-
-    u_s = u_star.unsqueeze(-1).unsqueeze(-1).expand_as(T_p)
-    x_u = (u_s * T_p).sum(dim=1).reshape(-1, 3)    
-
-    spike = log_spike.exp()
-    mu, logvar = mu_sig[:, 0:1], mu_sig[:, 1:2]
-    mu_p, logvar_p, log_gamma_p = x_u[:, 0:1], x_u[:, 1:2], x_u[:, 2:3]
-    spike_p = log_gamma_p.exp()
-    KL_mu_sig = (-0.5 * spike.mul(1 + logvar - logvar_p - 
-                 (logvar.exp().sqrt() + (mu - mu_p).pow(2))/(logvar_p.exp().sqrt())))
-    KL_spike = (1 - spike) * (torch.log(1 - spike + eps) -  torch.log(1 - spike_p + eps))
-    KL_slab = spike * (torch.log(spike + eps) - torch.log(spike_p + eps))
-    KL = KL_mu_sig + KL_spike + KL_slab
-    
-    return KL.sum() / batch_size
-
-def kl_spike_only(mu_sig, log_spike, alpha, device):
-    eps = 1e-6
-    mu, logvar = mu_sig[:, 0:1], mu_sig[:, 1:2]
-    spike = torch.clamp(log_spike.exp(), eps, 1-eps) #[batch * edges, 1]
-    alpha = alpha.to(device) #[num_edges] > [1, edges, 1] > [batch, edges, 1] > [batch * edges, 1]
-    alpha_expand = alpha.unsqueeze(0)
-    alpha_expand = alpha_expand.expand_as(spike).clone() 
-    alpha_expand = torch.clamp(alpha_expand, eps, 1 - eps)
-
-    KL_mu_sig = -0.5 * spike.mul(1 + logvar - logvar.exp().sqrt() - mu.pow(2))
-    KL_spike = (1 - spike) * (torch.log(1 - spike) - torch.log(1 - alpha_expand))
-    KL_slab = spike * (torch.log(spike) - torch.log(alpha_expand))
-    KL = KL_mu_sig + KL_slab + KL_spike
-    return KL.sum() / mu_sig.shape[0]
-
-def poisson_nll_with_deltaT(log_lambda, tar_spike, delta_T):
-    loss_poisson = delta_T * log_lambda.exp() - tar_spike * log_lambda
-    return loss_poisson.mean()
-
-def poisson_nll(log_lambda, tar_spike, eps):
-    log_lambda = torch.clamp(log_lambda, min=eps, max=1e2)
-    loss_poisson = log_lambda.exp() - tar_spike * log_lambda
-    return loss_poisson.mean()
-
-def penalty_term(log_spike_p, u_star, alpha, n_edges, device):
-    eps = 1e-6
-    batch_size = u_star.shape[0]
-    expand_size = [batch_size] + list(log_spike_p.reshape(-1, n_edges, 1).shape)
-    gamma = log_spike_p.exp().reshape(-1, n_edges, 1).unsqueeze(0).expand(expand_size) # 128 20 20 1
-
-    u_s = u_star.unsqueeze(-1).unsqueeze(-1).expand_as(gamma)
-    gamma_bar = (u_s * gamma).sum(1).squeeze() #128 20
-    alpha = alpha.to(device) #[num_edges] > [1, edges, 1] > [batch, edges, 1] > [batch * edges, 1]
-    alpha_expand = alpha.unsqueeze(0).unsqueeze(-1)
-    alpha_expand = alpha_expand.expand(batch_size, n_edges, 1).reshape(-1, 1) 
-    alpha_expand = torch.clamp(alpha_expand, eps, 1 - eps)
-    KL = (gamma_bar.mul(torch.log(gamma_bar + eps) - torch.log(alpha + eps)).sum() + 
-          (1 - gamma_bar).mul(torch.log((1 - gamma_bar) + eps) - torch.log((1 - alpha) + eps)).sum())
-    return KL * n_edges / log_spike_p.shape[0]
-
-def load_springs(nodes, edge_types, data_dir):
-    if nodes == 5:
-        if edge_types == 3:
-            tr = spring5_edge3_train(data_dir)
-            val = spring5_edge3_valid(data_dir)
-            test = spring5_edge3_test(data_dir)
-        elif edge_types == 10:
-            tr = spr_e10n5_tr(data_dir)
-            val = spr_e10n5_val(data_dir)
-            test = spr_e10n5_test(data_dir)
-
-    elif nodes == 10:
-        if edge_types == 3:
-            tr = spr_e3n10_tr(data_dir)
-            val = spr_e3n10_val(data_dir)
-            test = spr_e3n10_test(data_dir)
-        elif edge_types == 10:
-            tr = spr_e10n10_tr(data_dir)
-            val = spr_e10n10_val(data_dir)
-            test = spr_e10n10_test(data_dir)
-    
-    return tr, val, test
-
-def load_springs_with_alphaD(nodes, edge_types, data_dir, alphaD):
-    if nodes == 5:
-        if edge_types == 10:
-            if alphaD == 0.3:
-                tr = spr_n5e10_a03_train(data_dir)
-                val = spr_n5e10_a03_valid(data_dir)
-                test = spr_n5e10_a03_test(data_dir)
-            if alphaD == 0.6:
-                tr = spr_n5e10_a06_train(data_dir)
-                val = spr_n5e10_a06_valid(data_dir)
-                test = spr_n5e10_a06_test(data_dir)
-            if alphaD == 0.9:
-                tr = spr_n5e10_a09_train(data_dir)
-                val = spr_n5e10_a09_valid(data_dir)
-                test = spr_n5e10_a09_test(data_dir)     
-    if nodes == 10:
-        if edge_types == 10:
-            if alphaD == 0.3:
-                tr = spr_n10e10_a03_train(data_dir)
-                val = spr_n10e10_a03_valid(data_dir)
-                test = spr_n10e10_a03_test(data_dir)
-        if edge_types == 10:
-            if alphaD == 0.6:
-                tr = spr_n10e10_a06_train(data_dir)
-                val = spr_n10e10_a06_valid(data_dir)
-                test = spr_n10e10_a06_test(data_dir)  
-        if edge_types == 10:
-            if alphaD == 0.9:
-                tr = spr_n10e10_a09_train(data_dir)
-                val = spr_n10e10_a09_valid(data_dir)
-                test = spr_n10e10_a09_test(data_dir)                  
-    return tr, val, test
+import matplotlib.pyplot as plt
 
 def make_z_sym(z, num_nodes, batch_num):
     z = z.reshape(batch_num, num_nodes, num_nodes-1)
@@ -212,20 +26,13 @@ def make_z_sym_nri(z, num_nodes, batch_num, edge_types):
     z = z.reshape(-1, edge_types)
     return z
 
-def make_z_sym_gts(z, num_nodes, device, mode):
+def make_z_sym_gts(z, edge_idx, num_nodes, mode):
     if mode == 'transpose':
         z = z.reshape(-1)
-        adj = torch.zeros(num_nodes, num_nodes).reshape(-1)
-        adj = adj.to(device)
-        for i in range(num_nodes - 1):
-            adj[(num_nodes+1)*i + 1:(num_nodes+1)*i + num_nodes + 1] = z[num_nodes*i: num_nodes*i + num_nodes]
-        adj = adj.reshape(num_nodes, num_nodes)
-        adj = (adj + adj.t()) / 2
-        
-        mask = (1 - torch.eye(num_nodes)).bool()
-        mask = mask.to(device)
-
-        z = torch.masked_select(adj, mask)
+        adj = pyg_utils.to_dense_adj(edge_idx, edge_attr=z)
+        adj = adj.squeeze()
+        adj = (adj + adj.t()) / 2 
+        edge_idx, z = pyg_utils.dense_to_sparse(adj)
     elif mode == 'ltmatonly':
         z = z.reshape(num_nodes, num_nodes-1)
         for i in range(num_nodes-1):
@@ -233,43 +40,7 @@ def make_z_sym_gts(z, num_nodes, device, mode):
         z = z.reshape(-1)
     else:
         assert False, 'Invalid Mode'
-    return z
-
-def circshift_z_nodemode(z, num_nodes, batch_num):
-    z = z.reshape(batch_num, num_nodes)
-    z_nodemode = z[:, 1:]
-    
-    expand_size = [batch_num, num_nodes-1, num_nodes]
-    z_nodemode_expand = z_nodemode.unsqueeze(-1)
-    z_edge = z_nodemode_expand.expand(expand_size).clone()
-
-    for i in range(num_nodes):
-        z_circshift = torch.roll(z_nodemode, shifts=i, dims=1)
-        z_edge[:, :, i] = z_circshift
-    z_edge = z_edge.permute(0, 2, 1)
-    z_edge = z_edge.reshape(-1, 1)
-    return z_edge
-
-def circshift_z(z, num_nodes, batch_num, ave_z=False):
-    if not(ave_z):
-        z = z.reshape(batch_num, -1)
-    else:
-        z = z.reshape(batch_num, -1)
-        z = z.mean(dim=0, keepdim=True)
-        
-    z = z[:, 0:num_nodes-1] # Use
-    z_expand = z.unsqueeze(-1)
-    expand_size = [batch_num, num_nodes-1, num_nodes]
-    z_edge = z_expand.expand(expand_size).clone()
-
-    for i in range(num_nodes):
-        z_circshift = torch.roll(z, shifts=i, dims=1)
-        z_edge[:, :, i] = z_circshift
-    z_edge = z_edge.permute(0, 2, 1)
-    if ave_z:
-        z_edge = z_edge.mean(dim=0)
-    z_edge = z_edge.reshape(-1, 1)
-    return z_edge
+    return edge_idx, z
 
 def calc_l1_dev_scaler(x, w_hat, w):
     l1_dev = np.abs(x*w_hat - w - np.mean(x*w_hat - w))
@@ -330,72 +101,6 @@ def scale_w_hat_scipy(w_hat, w_tar):
     l2_tar = np.linalg.norm(w_tar_vec, ord=2)
     return k_argmin, l2_loss/l2_tar, w_hat_vec, w_tar_vec, w_hat_std
 
-def load_neural_spike(data_dir, neuron, timesteps, data_ratio=1):
-    if neuron == 'ring':
-        if timesteps == 50:
-            tr = gen_spike.spike_ring_binned_train_50(data_dir)
-            val = gen_spike.spike_ring_binned_valid_50(data_dir)
-            test = gen_spike.spike_ring_binned_test_50(data_dir)
-        elif timesteps == 100:
-            tr = gen_spike.spike_ring_binned_train_100(data_dir)
-            val = gen_spike.spike_ring_binned_valid_100(data_dir)
-            test = gen_spike.spike_ring_binned_test_100(data_dir)
-        elif (timesteps == 200) and (data_ratio == 1):
-            tr = gen_spike.spike_ring_raw_train(data_dir)
-            val = gen_spike.spike_ring_raw_valid(data_dir)
-            test = gen_spike.spike_ring_raw_test(data_dir)        
-    elif neuron == 'LNP':
-        if timesteps == 50:
-            tr = gen_spike.spike_LNP_binned_train_50(data_dir)
-            val = gen_spike.spike_LNP_binned_valid_50(data_dir)
-            test = gen_spike.spike_LNP_binned_test_50(data_dir)
-        elif timesteps == 100:
-            tr = gen_spike.spike_LNP_binned_train_100(data_dir)
-            val = gen_spike.spike_LNP_binned_valid_100(data_dir)
-            test = gen_spike.spike_LNP_binned_test_100(data_dir)
-        elif (timesteps == 200) and (data_ratio == 1):
-            tr = gen_spike.spike_LNP_raw_train_1(data_dir)
-            val = gen_spike.spike_LNP_raw_valid_1(data_dir)
-            test = gen_spike.spike_LNP_raw_valid_1(data_dir)
-        elif (timesteps == 200) and (data_ratio == 100):
-            tr = gen_spike.spike_LNP_raw_train_whole(data_dir)
-            val = gen_spike.spike_LNP_raw_valid_whole(data_dir)
-            test = gen_spike.spike_LNP_raw_test_whole(data_dir)
-    return tr, val, test
-
-def load_neural_spike_bin(data_dir, pred_step, percentage):
-    if pred_step == 20:
-        if percentage == 100:
-            tr = gen_spike.spike_LNP_bin_train_whole(data_dir)
-            val = gen_spike.spike_LNP_bin_valid_whole(data_dir)
-            test = gen_spike.spike_LNP_bin_test_whole(data_dir)
-        elif percentage == 1:
-            tr = gen_spike.spike_LNP_bin_train_1(data_dir)
-            val = gen_spike.spike_LNP_bin_valid_1(data_dir)
-            test = gen_spike.spike_LNP_bin_test_1(data_dir)
-    elif pred_step == 40:
-        tr = gen_spike.spike_LNP_bin_train_whole_40(data_dir)
-        val = gen_spike.spike_LNP_bin_valid_whole_40(data_dir)
-        test = gen_spike.spike_LNP_bin_test_whole_40(data_dir)
-    return tr, val, test
-
-def load_neural_spike_bin_phase2(data_dir, pred_step, percentage, mode):
-    if pred_step == 20:
-        if percentage == 100:
-            if mode == 'zero':
-                tr = gen_spike.LNP_bin_zeros_train(data_dir)
-                val = gen_spike.LNP_bin_zeros_valid(data_dir)
-                test = gen_spike.LNP_bin_zeros_test(data_dir)
-            elif mode == 'rand':
-                tr = gen_spike.LNP_bin_rand_train(data_dir)
-                val = gen_spike.LNP_bin_rand_valid(data_dir)
-                test = gen_spike.LNP_bin_rand_test(data_dir)            
-            elif mode == 'init':
-                tr = gen_spike.LNP_init_bin_train(data_dir)
-                val = gen_spike.LNP_init_bin_valid(data_dir)
-                test = gen_spike.LNP_init_bin_test(data_dir)
-    return tr, val, test
-
 def spec_decompose(mat, count):
     mat_spec = np.zeros_like(mat)
     
@@ -444,7 +149,7 @@ def z_to_adj_plot(z, nodes):
     adj = np.zeros(nodes * nodes)
     
     for i in range(nodes - 1):
-        adj[i*(nodes+1) + 1:(i+1)*(nodes+1)] = z[i*nodes: (i+1)*nodes]
+        adj[i*(nodes+1) + 1:(i+1)*(nodes+1)] = z[i*nodes: (i+1)*nodes] #dim 98 why?
     
     adj = adj.reshape(nodes, nodes)
     return adj
@@ -524,3 +229,565 @@ def to_dec_batch_ptar_plot(spike_whole, nodes, history, pred_step, p2_bs):
 
     return spike_window_whole, spike_target_whole
 
+def decimation_method_iterX(inputs, is_spike, is_manual, rm_step=0):
+    if is_spike:
+        lam_whole = inputs.clone()
+        spike_whole = torch.poisson(lam_whole)
+        pre_rmv = 2*spike_whole - 1
+    else:
+        pre_rmv = inputs.clone()
+
+    num_neurons = pre_rmv.shape[0]
+    total_steps = pre_rmv.shape[1]
+    # Get spike index
+    nonzero_idx = torch.where(pre_rmv.any(dim=0))[0]
+    nonzero_idx = nonzero_idx.detach().cpu().numpy()
+    delta_R_spike = []
+    # Get zeros index
+    zeros_idx = torch.where(~pre_rmv.any(dim=0))[0]
+    rand_perm = torch.randperm(torch.numel(zeros_idx))
+    zeros_idx = zeros_idx[rand_perm]
+
+    corr_org = torch.matmul(pre_rmv, pre_rmv.transpose(1, 0)) / num_neurons
+    
+    for idx_s in tqdm(nonzero_idx):
+        s = pre_rmv[:, idx_s].reshape(-1, 1)
+        delta_R = decimation_removal(corr_org, s, total_steps, False)
+        delta_R_spike.append(delta_R.detach().cpu().item())
+
+    delta_R_spike = np.array(delta_R_spike)
+    idx_spk_sort = np.argsort(delta_R_spike)[::-1]
+    nonzero_idx = nonzero_idx[idx_spk_sort]
+    delta_R_spike = delta_R_spike[idx_spk_sort]
+
+    delta_R_return = delta_R_spike.copy()
+    
+    idx_config_removal = []
+    R_ipr = []
+    lam_list = []
+
+    C_crnt = corr_org
+    m = total_steps
+
+    if is_manual:
+        for _ in tqdm(range(rm_step)):
+            if torch.numel(zeros_idx) == 0:
+                delta_R_zeros = -np.inf    
+            else:
+                s_z = pre_rmv[:, zeros_idx[0]].reshape(-1, 1)
+                delta_R_zeros = decimation_removal(C_crnt, s_z, m, False)
+            
+            if delta_R_spike.max() > delta_R_zeros:
+                idx_config_removal.append(nonzero_idx[0])
+                s_sm = pre_rmv[:, nonzero_idx[0]].reshape(-1, 1)
+                C = decimation_removal(C_crnt, s_sm, m, True)
+                nonzero_idx = nonzero_idx[1:]
+                delta_R_spike = delta_R_spike[1:]
+            else:
+                zeros_rmv = zeros_idx[0]
+                idx_config_removal.append(zeros_rmv)
+                zeros_idx = zeros_idx[1:]
+                s_zm = pre_rmv[:, zeros_rmv].reshape(-1, 1)
+                C = decimation_removal(C_crnt, s_zm, m, True)
+
+            R_crnt, lam = get_R_ipr(C_crnt)
+            R_next, _ = get_R_ipr(C)
+            R_ipr.append(R_crnt.detach().cpu().numpy())
+            lam_list.append(lam.detach().cpu().numpy())
+            C_crnt = C
+            m = m - 1
+
+        idx_remaining = np.ones(total_steps)
+        idx_remaining[idx_config_removal] = 0
+        idx_remaining = np.where(idx_remaining == 1)[0]
+        
+        rmvd = pre_rmv[:, idx_remaining]
+        rmvd = rmvd.detach().cpu().numpy()
+        lam_np = np.stack(lam_list, axis=0)
+        R_ipr = np.stack(R_ipr, axis=0)
+
+        return rmvd, lam_np, R_ipr, delta_R_return, nonzero_idx
+        
+    else:
+        pbar = tqdm(total=total_steps)
+        while(True):
+            if torch.numel(zeros_idx) == 0:
+                delta_R_zeros = -np.inf    
+            else:
+                s_z = pre_rmv[:, zeros_idx[0]].reshape(-1, 1)
+                delta_R_zeros = decimation_removal(C_crnt, s_z, m, False)
+            
+            if delta_R_spike.max() > delta_R_zeros:
+                idx_config_removal.append(nonzero_idx[0])
+                s_sm = pre_rmv[:, nonzero_idx[0]].reshape(-1, 1)
+                C = decimation_removal(C_crnt, s_sm, m, True)
+                nonzero_idx = nonzero_idx[1:]
+                delta_R_spike = delta_R_spike[1:]
+            else:
+                zeros_rmv = zeros_idx[0]
+                idx_config_removal.append(zeros_rmv)
+                zeros_idx = zeros_idx[1:]
+                s_zm = pre_rmv[:, zeros_rmv].reshape(-1, 1)
+                C = decimation_removal(C_crnt, s_zm, m, True)
+
+            R_crnt, lam = get_R_ipr(C_crnt)
+            R_next, _ = get_R_ipr(C)
+            R_ipr.append(R_crnt.detach().cpu().numpy())
+            lam_list.append(lam.detach().cpu().numpy())
+            C_crnt = C
+            m = m - 1
+
+            pbar.update(1)
+            if (R_next - R_crnt) < 0:
+                idx_remaining = np.ones(total_steps)
+                idx_remaining[idx_config_removal] = 0
+                idx_remaining = np.where(idx_remaining == 1)[0]
+                rmvd = pre_rmv[:, idx_remaining]
+                rmvd = rmvd.detach().cpu().numpy()
+
+                lam_np = np.stack(lam_list, axis=0)
+                R_ipr = np.stack(R_ipr, axis=0)
+                pbar.close()
+                return rmvd, lam_np, R_ipr, delta_R_return, nonzero_idx
+
+def decimation_method_iterO(spikes):
+    spike_whole = spikes.clone()
+    num_neurons = spike_whole.shape[0]
+    total_steps = spike_whole.shape[1]
+
+    corr_org = torch.matmul(spikes, spikes.transpose(1, 0)) / num_neurons
+    
+    spike_idx = torch.where(spike_whole.any(axis=0))[0]
+    zeros_idx = torch.where(~spike_whole.any(axis=0))[0]
+    rand_perm = torch.randperm(torch.numel(zeros_idx))
+    zeros_idx = zeros_idx[rand_perm]
+    
+    idx_config_removal = []
+    R_ipr = []
+    lam_list = []
+    
+    C_crnt = corr_org
+    m = total_steps
+    while(True):
+        delta_R_spike = []
+    
+        for idx_s in tqdm(spike_idx):
+            s = spike_whole[:, idx_s].reshape(-1, 1)
+            delta_R = decimation_removal(C_crnt, s, m, False)
+            delta_R_spike.append(delta_R.detach().cpu().item())
+    
+        if torch.numel(zeros_idx) == 0:
+            delta_R_zeros = -np.inf    
+        else:
+            s_z = spike_whole[:, zeros_idx[0]].reshape(-1, 1)
+            delta_R_zeros = decimation_removal(C_crnt, s_z, m, False)
+    
+        delta_R_spike = np.array(delta_R_spike)
+        if delta_R_spike.max() > delta_R_zeros:
+            print(delta_R_spike.max())
+            idx_spk_max = delta_R_spike.argmax()
+            idx_spk_rmv = spike_idx[idx_spk_max]
+            spike_idx = spike_idx[spike_idx != idx_spk_rmv]
+            idx_config_removal.append(idx_spk_rmv)
+            s_sm = spike_whole[:, idx_spk_rmv].reshape(-1, 1)
+            C = decimation_removal(C_crnt, s_sm, m, True)
+    
+        else:
+            print(delta_R_zeros)
+            zeros_rmv = zeros_idx[0]
+            idx_config_removal.append(zeros_rmv)
+            zeros_idx = zeros_idx[1:]
+            s_zm = spike_whole[:, zeros_rmv].reshape(-1, 1)
+            C = decimation_removal(C_crnt, s_zm, m, True)
+    
+        R_crnt, lam = get_R_ipr(C_crnt)
+        R_next, _ = get_R_ipr(C)
+        R_ipr.append(R_crnt.detach().cpu().numpy())
+        lam_list.append(lam.detach().cpu().numpy())
+    
+        C_crnt = C
+        m = m - 1
+    
+        if (R_next - R_crnt) < 0:
+            idx_remaining = np.ones(total_steps)
+            idx_remaining[idx_config_removal] = 0
+            idx_remaining = np.where(idx_remaining == 1)[0]
+            spike_whole = spike_whole[:, idx_remaining]
+            lam_np = np.stack(lam_list, axis=0)
+            R_ipr = np.stack(R_ipr, axis=0)
+    
+            return spike_whole, lam_np, R_ipr
+
+def spike_plot(spikes, binning, aspect, suffix):
+    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 5))
+    num_neurons = spikes.shape[0]
+    time = spikes.shape[1] / 1e4
+    end_step = int((spikes.shape[1] // binning) * binning)
+    spikes = spikes[:, :end_step].reshape(num_neurons, -1, binning)
+    spikes_binned = spikes.sum(axis=-1).reshape(num_neurons, -1)
+
+    extent = [0, time, 0, num_neurons]
+    axes.set_aspect(aspect)
+
+    im = axes.imshow(spikes_binned, cmap='binary', extent=extent)
+    axes.tick_params(axis='x', labelsize=10)
+    axes.tick_params(axis='y', labelsize=10)
+
+    cax = fig.add_axes([axes.get_position().x1+0.01,axes.get_position().y0,0.02,axes.get_position().height])
+    cbar = plt.colorbar(im, cax=cax)
+    cbar.ax.tick_params(axis='y', labelsize=20)
+    plt.savefig('./fig/decimation/spk_{}'.format(suffix), bbox_inches='tight')
+    plt.show()
+    plt.close('all')
+
+def save_decimation(spikes, rm_step, p_spars, rm_mode, neuron_type, device, rm_zeros, if_rmv_zeros=False):
+    p_str = str(p_spars).replace('.', '')
+    if if_rmv_zeros:
+        suffix = '{}_cprd_{}'.format(neuron_type, rm_step)
+    else:
+        suffix = '{}_{}_{}_{}'.format(neuron_type, rm_mode, rm_step, p_str)
+    print(suffix)
+    if if_rmv_zeros:
+        spk_prd, _ = decimation_method_iterX(spikes, rm_zeros, rm_mode, p_spars, device, if_rmv_zeros)
+    else:
+        spk_prd, _ = decimation_method_iterX(spikes, rm_step, rm_mode, p_spars, device)
+    spike_plot(spk_prd, 100, 1, suffix)
+    np.save('data/decimation/{}.npy'.format(suffix), spk_prd)
+
+def check_isi(spikes):
+    num_spikes = np.count_nonzero(spikes)
+    spk_steps = len(np.where(spikes.any(axis=0))[0])
+    total_steps = spikes.shape[1]
+    isi = num_spikes / spikes.size
+    target_isi = 1/160
+    num_removal = int((spikes.size - (num_spikes / target_isi)) / 100)
+
+    print('Total steps: {}, number of spike steps is {}'.format(total_steps, spk_steps))
+    print('Try to meet ISI condition, {} steps of zero steps should be removed'.format(num_removal))
+    return isi, num_removal, spk_steps, total_steps
+
+def remove_zeros(spikes, removal_count):
+    spike_whole = spikes.copy()
+    total_steps = spike_whole.shape[1]
+    
+    zeros_idx = np.where(~spike_whole.any(axis=0))[0]
+    rmv_idx = np.random.choice(zeros_idx, size=removal_count, replace=False)
+    
+    idx_remaining = np.ones(total_steps)
+    idx_remaining[rmv_idx] = 0
+    idx_remaining = np.where(idx_remaining == 1)[0]
+    spike_whole = spike_whole[:, idx_remaining]
+    
+    return spike_whole
+
+def get_R_ipr(C):
+    num_neurons = C.shape[0]
+    lam, _ = torch.linalg.eigh(C)
+    lam_scaler = num_neurons / torch.abs(lam).sum()
+    lam = lam * lam_scaler
+    sig = torch.sqrt(torch.abs(lam))
+    r_i = sig / sig.sum()
+    R_ipr = 1 / (r_i ** 2).sum()
+    return R_ipr, torch.abs(lam)
+
+def decimation_removal(C, single_config, num_configs, if_update_C):
+    lam, vec_all = torch.linalg.eigh(C)
+    num_neurons = C.shape[0]
+    vec_all = vec_all.transpose(1, 0).reshape(-1, 1, num_neurons)
+    vec_all_T = vec_all.permute(0, 2, 1)
+    
+    delta_C = (C - torch.matmul(single_config, single_config.transpose(1, 0))) / (num_configs - 1)
+    if if_update_C:
+        C_rmvd = C + delta_C
+        return C_rmvd
+    else:
+        delta_lam = torch.matmul(vec_all, delta_C)
+        delta_lam = torch.matmul(delta_lam, vec_all_T)
+        delta_R = (1/torch.sqrt(torch.abs(lam)) * delta_lam.squeeze()).sum()
+    return delta_R
+
+def plot_lambdas(lam, suffix):
+    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 5))
+    
+    num_rmvs = lam.shape[0]
+    num_neurons = lam.shape[1]
+    x = np.arange(num_neurons) + 1
+
+    for i in range(num_rmvs):
+        axes.plot(x, lam[i, :])
+
+    plt.savefig('./fig/decimation/lam_{}'.format(suffix), bbox_inches='tight')
+    plt.close('all')
+
+def plot_lamlist(lam_list, label_list, suffix):
+    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 5))
+    
+    num_neurons = lam_list[0].size
+    x = np.arange(num_neurons) + 1
+
+    for i in range(len(lam_list)):
+        axes.plot(x, lam_list[i], label=label_list[i])
+
+    plt.legend(loc=2, prop={'size': 20})
+    plt.savefig('./fig/decimation/lam_{}'.format(suffix), bbox_inches='tight')
+    plt.close('all')
+
+def plot_Ripr(R_ipr, suffix):
+    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 5))
+    x = np.arange(R_ipr.size) + 1
+    axes.plot(x, R_ipr)
+    plt.savefig('./fig/decimation/Ripr_{}'.format(suffix), bbox_inches='tight')
+    plt.close('all')
+
+def save_directory(args):
+    check_neuron_type = (args.neurons == 'lnp') or (args.neurons == 'binary')
+    check_decoder = (args.decoder == 'log') or (args.decoder == 'lam')
+    assert check_neuron_type, 'Invalid neuron type, try with {lnp or binary,}'
+    assert check_decoder, 'Invalid decoder type, try with {log or lam}'
+
+    if args.dataset == 'neural_spike':
+        save_folder = 'model/neural_spike/exp{}'.format(args.exp_num)
+    elif args.dataset == 'mouse_head_direction':
+        save_folder = 'model/mouse_hd/exp{}'.format(args.exp_num)
+    else:
+        assert False, 'Invaild dataset, try {neural_spike of mouse_hd}'
+
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+
+    directory_list = []
+    if args.experiment == 'perturb_joint':
+        directory_list.append(save_folder + '/enc_1.pt')
+        directory_list.append(save_folder + '/enc_2.pt')
+        directory_list.append(save_folder + '/dec_1.pt')
+        directory_list.append(save_folder + '/dec_2.pt')
+        directory_list.append(save_folder + '/loss.npy')
+        directory_list.append(save_folder + '/log.txt')
+        directory_list.append(save_folder + '/z_1.npy')
+        directory_list.append(save_folder + '/z_2.npy')
+    else:
+        directory_list.append(save_folder + '/enc.pt')
+        directory_list.append(save_folder + '/dec.pt')
+        directory_list.append(save_folder + '/loss.npy')
+        directory_list.append(save_folder + '/log.txt')
+        directory_list.append(save_folder + '/z.npy')
+    return save_folder, directory_list
+
+def plot_directory(args):
+    with_hd_input = args.dataset == 'mouse_head_direiction' and args.experiment == 'with_hd_input'
+
+    if args.dataset == 'neural_spike':
+        plot_folder = 'plot/neural_spike/exp{}'.format(args.exp_num)
+        fig_folder = 'fig/neural_spike/exp{}'.format(args.exp_num)
+    elif args.dataset == 'mouse_head_direction':
+        plot_folder = 'plot/mouse_hd/exp{}'.format(args.exp_num)
+        fig_folder = 'fig/mouse_hd/exp{}'.format(args.exp_num)
+    else:
+        assert False, 'Invaild dataset, try {neural_spike of mouse_hd}'
+
+    if not os.path.exists(plot_folder):
+        os.makedirs(plot_folder)
+
+    if not os.path.exists(fig_folder):
+        os.makedirs(fig_folder)
+
+    directory_list = []
+    if args.experiment == 'perturb_joint':
+        directory_list.append(plot_folder + '/spk_tar_p1.npy')
+        directory_list.append(plot_folder + '/spk_pred_p1.npy')
+        directory_list.append(plot_folder + '/lam_tar_p1.npy')
+        directory_list.append(plot_folder + '/lam_pred_p1.npy')
+        directory_list.append(plot_folder + '/z1.npy')
+        directory_list.append(plot_folder + '/spk_tar_p2.npy')
+        directory_list.append(plot_folder + '/spk_pred_p2.npy')
+        directory_list.append(plot_folder + '/lam_tar_p2.npy')
+        directory_list.append(plot_folder + '/lam_pred_p2.npy')
+        directory_list.append(plot_folder + '/z2.npy')        
+    else:
+        directory_list.append(plot_folder + '/spk_tar.npy')
+        directory_list.append(plot_folder + '/spk_pred.npy')
+        directory_list.append(plot_folder + '/lam_tar.npy')
+        directory_list.append(plot_folder + '/lam_pred.npy')
+        directory_list.append(plot_folder + '/z.npy')
+        
+        if with_hd_input:
+            directory_list.append(plot_folder + '/ang_pred.npy')
+            directory_list.append(plot_folder + '/ang_tar.npy')
+    return fig_folder, plot_folder, directory_list
+
+def load_plot_file(plot_directory):
+    file_list = []
+    for dirs in plot_directory:
+        file_list.append(np.load(dirs))
+    return file_list
+
+def load_models(num_neurons, args, device):
+    tr_length = int(args.gts_totalstep / args.bin)
+    adj_inf_model = gts_adj_inf(num_neurons, args.hid_dim, args.out_channel, args.kernal_x_1, args.kernal_x_2,
+                                args.stride_x_1, args.stride_x_2, tr_length)
+    batch_size = args.phase1_batchsize
+
+    with_hd_input = args.dataset == 'mouse_head_direction' and args.experiment == 'with_hd_input'
+    no_external_input = args.dataset == 'neural_spike' or \
+                        (args.dataset == 'mouse_head_direction' and args.experiment == 'no_hd_input')
+
+    if with_hd_input:
+        decoder = GNN_ENC_mousehd(num_neurons, args.history, args.hid_dim, args.dec_f_emb, args.activation)
+    
+    elif no_external_input:
+        decoder = RNN_DEC_log(num_neurons, args.history, args.hid_dim, batch_size, 
+                              args.dec_f_emb, args.dec_g1, args.g1_dim, args.activation)
+    
+    else:
+        assert False, 'Invalid Experiment Configuration, \
+            Try dataset + experiment for {mouse_hd_direction + with_hd_input / no_hd_input}  or\
+            dataset for neural_spike'
+    
+    adj_inf_model, decoder = adj_inf_model.to(device), decoder.to(device)
+    return adj_inf_model, decoder
+
+def load_dataset(num_neurons, args, if_test, shuffle=True):
+    history, pred_step, batch_size, rm_step = args.history, args.pred_step_p1, args.phase1_batchsize, args.removal_step
+    neuron_type = args.neurons
+
+    if args.dataset == 'neural_spike':
+        if args.experiment == 'perturb_target':
+            recording = 'pt'
+        else:
+            recording = 'eq'
+
+        gts_featmat = np.load('data/spk_raw_{}_{}.npy'.format(recording, neuron_type))[:, :args.gts_totalstep]
+        gts_featmat = gts_featmat.reshape(num_neurons, -1, args.bin).sum(axis=-1)
+
+        if if_test:
+            if args.experiment == 'perturb_target':
+                testset = data_spike_poisson_rate(history, pred_step, 'test', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='pt', rm_step=rm_step, 
+                                                decimated=False)
+                edge_idx = testset.get_adjmat()
+                test_loader = DataLoader(testset, batch_size=batch_size, shuffle=False) 
+            elif args.experiment == 'perturb_decimation':
+                testset = data_spike_poisson_rate(history, pred_step, 'test', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step, 
+                                                decimated=True)
+                edge_idx = testset.get_adjmat()
+                test_loader = DataLoader(testset, batch_size=batch_size, shuffle=False) 
+            else:
+                testset = data_spike_poisson_rate(history, pred_step, 'test', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step, 
+                                                decimated=False)
+                edge_idx = testset.get_adjmat()
+                test_loader = DataLoader(testset, batch_size=batch_size, shuffle=False) 
+                
+            return test_loader, gts_featmat, edge_idx
+        
+        else:
+            if args.experiment == 'perturb_target':
+                trainset = data_spike_poisson_rate(history, pred_step, 'train', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='pt', rm_step=rm_step, 
+                                                decimated=False)
+                validset = data_spike_poisson_rate(history, pred_step, 'valid', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='pt', rm_step=rm_step, 
+                                                decimated=False)
+                edge_idx = trainset.get_adjmat()
+                train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=shuffle) 
+                valid_loader = DataLoader(validset, batch_size=batch_size, shuffle=shuffle)
+            elif args.experiment == 'perturb_decimation':
+                trainset = data_spike_poisson_rate(history, pred_step, 'train', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step,
+                                                decimated=True)
+                validset = data_spike_poisson_rate(history, pred_step, 'valid', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step,
+                                                decimated=True)
+                edge_idx = trainset.get_adjmat()
+                train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=shuffle) 
+                valid_loader = DataLoader(validset, batch_size=batch_size, shuffle=shuffle)
+            else:
+                trainset = data_spike_poisson_rate(history, pred_step, 'train', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step, 
+                                                decimated=False)
+                validset = data_spike_poisson_rate(history, pred_step, 'valid', binning=args.bin, 
+                                                neuron_type=neuron_type, recording='eq', rm_step=rm_step, 
+                                                decimated=False)
+                edge_idx = trainset.get_adjmat()
+                train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=shuffle)
+                valid_loader = DataLoader(validset, batch_size=batch_size, shuffle=shuffle)
+                
+            return train_loader, valid_loader, gts_featmat, edge_idx
+    
+    elif args.dataset == 'mouse_head_direction':
+        if not if_test:
+            trainset = mouse_head_direction(history, pred_step, 'train')
+            validset = mouse_head_direction(history, pred_step, 'valid')
+            pref_HD, edge_idx = trainset.get_pref_HD(), trainset.get_adjmat()
+            gts_featmat = np.load('data/mouse/gts_featmat.npy')
+            train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+            valid_loader = DataLoader(validset, batch_size=batch_size, shuffle=True)
+            return train_loader, valid_loader, gts_featmat, pref_HD, edge_idx
+
+        else:
+            testset = mouse_head_direction(history, pred_step, 'test')
+            pref_HD, edge_idx = testset.get_pref_HD(), testset.get_adjmat()
+            gts_featmat = np.load('data/mouse/gts_featmat.npy')
+            test_loader = DataLoader(testset, batch_size=batch_size, shuffle=False)
+            return test_loader, gts_featmat, pref_HD, edge_idx
+
+    else:
+        assert False, 'Invalid dataset, try {neural_spike or mouse_head_direction}'
+
+def write_exp_log(file, args):
+    if os.path.isfile(file):
+        exp_log = open(file, 'a')
+    else:
+        exp_log = open(file, 'w')
+
+    str_args = str(args)
+    str_args = str_args.replace('Namespace(', '')
+    str_args = str_args.replace(')', '')
+    str_args = str_args.replace(',', '')
+    str_args = str_args.replace(' ', ' --')
+    str_args = str_args.replace('=', ' ')
+    str_args = '--' + str_args + '\n'
+
+    exp_log.write(str_args)
+    exp_log.close()
+
+def write_inf_log(file, logs):
+    if os.path.isfile(file):
+        exp_log = open(file, 'a')
+    else:
+        exp_log = open(file, 'w')
+
+    str_inf_err = ''
+    for item in logs:
+        str_inf_err = str_inf_err + str(item) + '\n'
+
+    exp_log.write(str_inf_err)
+    exp_log.close()
+
+def get_corr_by_rows(out, tar):
+    corr_list = []
+    for i in range(out.shape[0]):
+        corr_single = np.corrcoef(out[i], tar[i])[1, 0]
+        corr_list.append(corr_single)
+    return corr_list
+
+def decimation_process(args, ins, device):
+    ins = torch.FloatTensor(ins).to(device)
+
+    if args.remove_spike:
+        ins = torch.poisson(ins)
+        if args.mode == 'decim_manual':
+            spk_rmvd, lams, R_iprs = decimation_method_iterX(ins, is_spike=True, is_manual=True, 
+                                                             rm_step=args.removal_step)
+        else:
+            spk_rmvd, lams, R_iprs = decimation_method_iterX(ins, is_spike=True, is_manual=False)
+        return spk_rmvd, lams, R_iprs
+
+    else:
+        if args.mode == 'decim_manual':
+            lam_rmvd, lams, R_iprs = decimation_method_iterX(ins, is_spike=False, is_manual=True,
+                                                             rm_step=args.removal_step)
+        else:
+            lam_rmvd, lams, R_iprs = decimation_method_iterX(ins, is_spike=False, is_manual=False)
+        return lam_rmvd, lams, R_iprs

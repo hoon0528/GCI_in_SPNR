@@ -1,8 +1,0 @@
-{
-    "python.pythonPath": "/Users/yoonlab_hoon/opt/anaconda3/envs/py36pg/bin/python",
-    "python.linting.pylintArgs": [
-        "--init-hook",
-        "import sys; sys.path.append('.')",
-        "--generated-members=numpy.*, torch.*"
-    ]
-}

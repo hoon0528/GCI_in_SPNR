@@ -9,219 +9,125 @@ import torch.nn.functional as F
 from torch.optim import lr_scheduler
 
 import yaml
-from generate_spike import data_spike_poisson_rate
-from model.nri_vsc_wo_pinputs import RNNDecoder_NRI_m2o_perturb
-from model.gts_adj import gts_adj_inf, gts_adj_inf_cs
 from utils import *
 
+#random.seed(42)
 torch.manual_seed(42)
+#torch.cuda.manual_seed(42)
+#np.random.seed(42)
+#torch.backends.cudnn.deterministic = True
+#torch.backends.cudnn.benchmark = False
 
+##################################### Argument ##############################################
 parser = argparse.ArgumentParser()
 # Dataset Configuration
-parser.add_argument('--config', type=str, default='_ss_wo_pin')
-parser.add_argument('--dataset', type=str, default='neural_spike')
-parser.add_argument('--neurons', type=str, default='LNP')
+parser.add_argument('--dataset', type=str, default='mouse_head_direction')
+parser.add_argument('--neurons', type=str, default='lnp') # binary/lnp
 parser.add_argument('--bin', type=int, default=1)
-parser.add_argument('--nodes', type=int, default=100)
 # Experiments Configuration
-parser.add_argument('--experiment', type=str, default='perturbation')
+parser.add_argument('--experiment', type=str, default='with_hd_input') # equilibrium or decimation / with_hd_input or no_hd_input
+parser.add_argument('--reconstruction', type=int, default=0)
 parser.add_argument('--loss_scaler', type=float, default=30)
 parser.add_argument('--history', type=int, default=200)
-parser.add_argument('--data_length_ratio', type=int, default=4)
-parser.add_argument('--pred_step_p1', type=int, default=4)
-parser.add_argument('--pred_step_p2', type=int, default=20)
+parser.add_argument('--pred_step_p1', type=int, default=20) # 20
+parser.add_argument('--msg_hop', type=int, default=2) # 1 2 4 8
 parser.add_argument('--perturb_step', type=int, default=200)
-parser.add_argument('--znorm', type=str, default='sigmoid')
+parser.add_argument('--decoder', type=str, default='log') #log lam
+parser.add_argument('--dec_f_emb', type=str, default='mlp') #conv mlp
+parser.add_argument('--dec_g1', type=str, default='identity') #identity mlp
+parser.add_argument('--activation', type=str, default='tanh') #tanh, sigmoid, relu
+parser.add_argument('--z_act', type=str, default='identity') #tanh, sigmoid, relu
+parser.add_argument('--if_symmode', type=int, default=0)
 parser.add_argument('--symmode', type=str, default='ltmatonly')
-parser.add_argument('--decoder', type=str, default='RNN_many_to_one')
-parser.add_argument('--adj_infmodel', type=str, default='gts')
-parser.add_argument('--adj_infstyle', type=str, default='complete')
 parser.add_argument('--add_similarity_z_term', type=int, default=1)
 parser.add_argument('--similarity_z_term', type=str, default='cos')
-parser.add_argument('--gts_complete', type=int, default=1)
-parser.add_argument('--gts_totalstep', type=int, default=40000)
+parser.add_argument('--gts_totalstep', type=int, default=3840000) #1280000
+parser.add_argument('--hidden_rand_init', type=int, default=1)
+parser.add_argument('--removal_step', type=int, default=1500000)
 # Dimension of Layers
-parser.add_argument('--enc_hid_dim', type=int, default=64)
-parser.add_argument('--dec_hid_dim', type=int, default=64)
-parser.add_argument('--dec_msg_dim', type=int, default=64)
-parser.add_argument('--out_channel', type=int, default=8)
+parser.add_argument('--hid_dim', type=int, default=32)
+parser.add_argument('--out_channel', type=int, default=10) # Set 10
+parser.add_argument('--g1_dim', type=int, default=10) # 1, 10
 parser.add_argument('--kernal_x_1', type=int, default=200)
 parser.add_argument('--kernal_x_2', type=int, default=200)
 parser.add_argument('--stride_x_1', type=int, default=20)
 parser.add_argument('--stride_x_2', type=int, default=20)
 # Learning features
-parser.add_argument('--epochs', type=int, default=50)
-parser.add_argument('--phase1_batchsize', type=int, default=80)
+parser.add_argument('--epochs', type=int, default=200)
+parser.add_argument('--phase1_batchsize', type=int, default=5)
 parser.add_argument('--phase2_batchsize', type=int, default=5)
 parser.add_argument('--device', type=str, default=0)
+# Exp. Num
+parser.add_argument('--exp_num', type=str, default=0)
 
-# create save_folder ant e.t.c
+############################ Hyperparams Configuration ######################################
 args = parser.parse_args()
-config_suffix = args.config + '_' + args.dataset + '200'
-with open('config/config{}.yml'.format(config_suffix), encoding='UTF8') as f:
-    setting = yaml.load(f, Loader=yaml.FullLoader)
-settings = setting.get('train')
 
-sim_setting = settings.get('sim_setting')
-model_params = settings.get('model_params')
+exp_log_file = 'exp_log_{}.txt'.format(args.dataset)
 
-num_nodes = args.nodes
-edge_types = sim_setting.get('edge_types')
-num_node_features = sim_setting.get('num_node_features') # Fixed(1) in Neural Spike data
-history = args.history
-pred_step_p1 = args.pred_step_p1
-pred_step_p2 = args.pred_step_p2
+with open('config/{}.yml'.format(args.dataset), encoding='UTF8') as f:
+    config = yaml.load(f, Loader=yaml.FullLoader)
 
-if args.neurons == 'LNP':
-    neuron_type = 'lnp'
-elif args.neurons == 'ring':
-    neuron_type = 'ring'
+exp_config = config.get('experiment')
+tr_config = config.get('training')
+model_config = config.get('model')
+
+num_nodes, neuron_type, args.gts_totalstep = exp_config.get('num_nodes'), args.neurons, exp_config.get('tr_length')
+history, pred_step_p1, msg_hop, rm_step = args.history, args.pred_step_p1, args.msg_hop, args.removal_step
+
+lr, lr_decay, gamma, epochs = tr_config.get('lr'), tr_config.get('lr_decay'), tr_config.get('gamma'), args.epochs
+p1_bs, p2_bs, perturb_step = args.phase1_batchsize, args.phase2_batchsize, args.perturb_step
+enc_hid = dec_msg_hid = dec_msg_out = dec_hid = args.hid_dim
+
+with_hd_input = args.dataset == 'mouse_head_direction' and args.experiment == 'with_hd_input'
+no_external_input = args.dataset == 'neural_spike' or \
+                    (args.dataset == 'mouse_head_direction' and args.experiment == 'no_hd_input')
+
+device = 'cuda:' + str(args.device)
+device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+########################## Set directories of trained models ###############################
+save_folder, model_directory = save_directory(args)
+
+if args.experiment == 'perturb_joint':
+    encoder1_file, encoder2_file = model_directory[0], model_directory[1]
+    decoder1_file, decoder2_file = model_directory[2], model_directory[3]
+    loss_file, log_file = model_directory[4], model_directory[5]
+    z1_file, z2_file = model_directory[6], model_directory[7]
 else:
-    assert False, 'Invalid neuron type'
+    encoder_file, decoder_file = model_directory[0], model_directory[1]
+    loss_file, log_file, z_file = model_directory[2], model_directory[3], model_directory[4]
 
-data_suffix = sim_setting.get('data') + '/' + args.neurons + str(args.history)
-model_params = settings.get('model_params')
-
-phase2_length = args.perturb_step * args.phase1_batchsize
-if args.add_similarity_z_term:
-    exp_config_suffix = 'add_zloss_' + args.similarity_z_term + '_' +  str(phase2_length)
-else:
-    exp_config_suffix = 'no_zloss_' + args.similarity_z_term + '_' + str(phase2_length)
-
-save_folder = model_params.get('model').get('save_folder') + data_suffix + '/' + 'perturbation'
-plot_folder = 'plot/' + data_suffix
-
-if not os.path.exists(save_folder):
-    os.makedirs(save_folder)
-
-print(exp_config_suffix)
-
-lr = model_params.get('training').get('lr')
-lr_decay = model_params.get('training').get('lr_decay')
-gamma = model_params.get('training').get('gamma')
-p1_bs = args.phase1_batchsize
-p2_bs = args.phase2_batchsize
-epochs = args.epochs
-perturb_step = args.perturb_step
-data_length_ratio = args.data_length_ratio
-
-enc_hid = args.enc_hid_dim
-dec_msg_hid = args.dec_hid_dim
-dec_msg_out = args.dec_msg_dim
-dec_hid = args.dec_hid_dim
-dec_drop = model_params.get('decoder').get('do_prob')
-
-device = sim_setting.get('device') + str(args.device)
-
-if args.bin:
-    bin_str = 'binned'
-else:
-    bin_str = 'raw'
-
-loss_scaler_str = str(args.loss_scaler).replace('.', '')
-
-if args.experiment == 'perturbation':
-    encoder_file = os.path.join(save_folder, 'enc_h{}_{}_{}.pt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    decoder_file = os.path.join(save_folder, 'dec_h{}_{}_{}.pt'.format(dec_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    loss_file = os.path.join(save_folder, 'loss_h{}_{}_{}.npy'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    log_file = os.path.join(save_folder, 'log_h{}_{}_{}.txt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-
-elif args.experiment == 'equilibrium':
-    encoder_file = os.path.join(save_folder, 'enc_h{}_{}_eq.pt'.format(enc_hid, exp_config_suffix))
-    decoder_file = os.path.join(save_folder, 'dec_h{}_{}_eq.pt'.format(dec_hid, exp_config_suffix))
-    loss_file = os.path.join(save_folder, 'loss_h{}_{}_eq.npy'.format(enc_hid, exp_config_suffix))
-    log_file = os.path.join(save_folder, 'log_h{}_{}_eq.txt'.format(enc_hid, exp_config_suffix))
-
-elif args.experiment == 'perturb_target':
-    if args.add_similarity_z_term:
-        exp_config_suffix = 'add_zloss_' + args.similarity_z_term
-    else:
-        exp_config_suffix = 'no_zloss_' + args.similarity_z_term
-    encoder1_file = os.path.join(save_folder, 'enc_h{}_{}_{}_ptar_1.pt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    encoder2_file = os.path.join(save_folder, 'enc_h{}_{}_{}_ptar_2.pt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    decoder1_file = os.path.join(save_folder, 'dec_h{}_{}_{}_ptar_1.pt'.format(dec_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    decoder2_file = os.path.join(save_folder, 'dec_h{}_{}_{}_ptar_2.pt'.format(dec_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    loss_file = os.path.join(save_folder, 'loss_h{}_{}_{}_ptar.npy'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    log_file = os.path.join(save_folder, 'log_h{}_{}_{}_ptar.txt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-
-elif args.experiment == 'perturb_target_only':
-    if args.add_similarity_z_term:
-        exp_config_suffix = 'add_zloss_' + args.similarity_z_term
-    else:
-        exp_config_suffix = 'no_zloss_' + args.similarity_z_term
-    encoder_file = os.path.join(save_folder, 'enc_h{}_{}_{}_pto.pt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    decoder_file = os.path.join(save_folder, 'dec_h{}_{}_{}_pto.pt'.format(dec_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    loss_file = os.path.join(save_folder, 'loss_h{}_{}_{}_pto.npy'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-    log_file = os.path.join(save_folder, 'log_h{}_{}_{}_pto.txt'.format(enc_hid, exp_config_suffix,
-                                                                       loss_scaler_str))
-
-else:
-    assert False, 'Invalid Experiment'
+print('{} {} {} DEC:{} {} {}'.format(args.neurons, args.experiment, args.bin, 
+                                     args.decoder + args.dec_f_emb, args.dataset, args.exp_num))
 
 if os.path.isfile(log_file):
     log = open(log_file, 'a')
 else:
     log = open(log_file, 'w')
-device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
-# Define models
-if args.adj_infstyle == 'circshift':
-    adj_inf_model = gts_adj_inf_cs(num_nodes, enc_hid, args.out_channel, args.kernal_x_1, args.kernal_x_2, 
-                                   args.stride_x_1, args.stride_x_2, args.gts_totalstep)
-elif args.adj_infstyle == 'complete':
-    adj_inf_model = gts_adj_inf(num_nodes, enc_hid, args.out_channel, args.kernal_x_1, args.kernal_x_2, 
-                                args.stride_x_1, args.stride_x_2, args.gts_totalstep)
-decoder = RNNDecoder_NRI_m2o_perturb(num_node_features, dec_hid, sim_setting, 
-                                     p1_bs, history, num_nodes, device)                            
-gts_featmat = np.load('data/gts_featuremat.npy')[:, :args.gts_totalstep]
+# Define models & Load dataset
+if args.dataset == 'neural_spike':
+    train_loader, valid_loader, gts_featmat, adj_mat = load_dataset(num_nodes, args, if_test=False)
+    
+elif args.dataset == 'mouse_head_direction':
+    train_loader, valid_loader, gts_featmat, pref_head_direction, adj_mat = \
+        load_dataset(num_nodes, args, if_test=False)
+    
+else:
+    assert False, 'Invalid dataset, try neural_spike or mouse_head_direction'
+adj_inf_model, decoder = load_models(num_nodes, args, device)
 
 # Optimizer setting
 optimizer = optim.Adam(list(adj_inf_model.parameters()) + list(decoder.parameters()), lr=lr)
 scheduler = lr_scheduler.StepLR(optimizer, step_size=lr_decay, gamma=gamma)
 
-# Load dataset
-if args.experiment == 'perturb_target_only':
-    trainset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'train', if_binned=False, 
-                                       neuron_type=neuron_type, recording='pt', length_ratio=1, 
-                                       data_circshift=False)
-    validset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'valid', if_binned=False, 
-                                       neuron_type=neuron_type, recording='pt', length_ratio=1, 
-                                       data_circshift=False)
-    train_loader = DL_Py(trainset, batch_size=1, shuffle=True) 
-    valid_loader = DL_Py(validset, batch_size=1, shuffle=True)
-else:
-    trainset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'train', if_binned=False, 
-                                       neuron_type=neuron_type, recording='eq', length_ratio=1, 
-                                       data_circshift=False)
-    validset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'valid', if_binned=False, 
-                                       neuron_type=neuron_type, recording='eq', length_ratio=1, 
-                                       data_circshift=False)
-    train_loader = DL_Py(trainset, batch_size=1, shuffle=True) 
-    valid_loader = DL_Py(validset, batch_size=1, shuffle=True)
+# Target weight profile of Neural Circuit
+weight_profile = np.load('data/connectivity_W100.npy')
+np.fill_diagonal(weight_profile, 0)
+weight_profile = weight_profile[~np.eye(weight_profile.shape[0],dtype=bool)].reshape(-1, 1)
 
-circshift_edge = np.zeros((num_nodes, num_nodes))
-circshift_edge[:, 0] = 1
-circshift_edge[0, :] = 1
-circshift_edge[0, 0] = 0
-
-edge_cs = np.where(circshift_edge)
-edge_cs = np.array([edge_cs[0], edge_cs[1]], dtype=np.int64)
-edge_cs = torch.LongTensor(edge_cs)
-edge_cs = edge_cs.to(device)
-
+################################### Training ##############################################
 def train_perturb(epoch, best_val_loss):
     t = time.time()
     
@@ -249,12 +155,12 @@ def train_perturb(epoch, best_val_loss):
 
         optimizer.zero_grad()
 
-        _, z1_corr = adj_inf_model(gts_input, edge_idx)
+        hidden_enc, z1_corr = adj_inf_model(gts_input, edge_idx)
         z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
         z1 = -torch.sigmoid(z1_corr)
         z1 = z1.reshape(-1, 1)
 
-        out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
+        out_p1 = decoder(x_spk, edge_idx, z1, hidden_enc, pred_step_p1)
         loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
 
         spike_p2 = []
@@ -333,12 +239,12 @@ def train_perturb(epoch, best_val_loss):
             
             optimizer.zero_grad()
 
-            _, z1_corr = adj_inf_model(gts_input, edge_idx)
+            hidden_enc, z1_corr = adj_inf_model(gts_input, edge_idx)
             z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
             z1 = -torch.sigmoid(z1_corr)
             z1 = z1.reshape(-1, 1)
 
-            out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
+            out_p1 = decoder(x_spk, edge_idx, z1, hidden_enc, pred_step_p1)
             loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
 
             spike_p2 = []
@@ -431,9 +337,9 @@ def train_eq_only(epoch, best_val_loss):
       
     gts_input = torch.FloatTensor(gts_featmat)
     gts_input = gts_input.to(device)
-    
+    edge_idx, pref_HD = adj_mat, pref_head_direction
+
     poisson_p1_train = []
-    z_loss_train = []
 
     adj_inf_model.train()
     decoder.train()
@@ -441,66 +347,118 @@ def train_eq_only(epoch, best_val_loss):
     adj_inf_model.to(device)
     decoder.to(device)
 
-    for batch_idx, data in tqdm(enumerate(train_loader)):
-        x_spk, tar_spk, edge_idx = data
-        x_spk, tar_spk, edge_idx = x_spk.squeeze(), tar_spk.squeeze(), edge_idx.squeeze()
-        x_spk, tar_spk, edge_idx = x_spk.to(device), tar_spk.to(device), edge_idx.to(device)
+    for _, data in tqdm(enumerate(train_loader)):
+        if args.dataset == 'neural_spike':
+            x_spk, tar_spk = data
+            x_spk, tar_spk = x_spk.to(device), tar_spk.to(device)
+            edge_idx = edge_idx.to(device)
+
+        elif args.dataset == 'mouse_head_direction':
+            x_spk, tar_spk, ang = data
+            x_spk, tar_spk, ang = x_spk.to(device), tar_spk.to(device), ang.to(device)
+            edge_idx, pref_HD = edge_idx.to(device), pref_HD.to(device)
+        
+        else:
+            assert False, 'Invalid dataset, Try neural_spike or mouse_head_direction'
+
+        tar_spk = tar_spk.transpose(0, 1)
 
         optimizer.zero_grad()
 
-        if args.adj_infstyle == 'complete':
-            _, z1_corr = adj_inf_model(gts_input, edge_idx)
-            z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
-        elif args.adj_infstyle == 'circshift':
-            _, z1_corr = adj_inf_model(gts_input, edge_cs)
+        _, z1_corr = adj_inf_model(gts_input, edge_idx)
+        if args.if_symmode:
+            edge_idx, z1 = make_z_sym_gts(z1_corr, edge_idx, num_nodes, args.symmode)
         else:
-            assert False, 'Try complete/cicrshift for adj_infstyle'
+            z1 = z1_corr
 
-        z1 = -torch.sigmoid(z1_corr)
+        if args.z_act == 'sigmoid':
+            z1 = -torch.sigmoid(z1)
+        elif args.z_act == 'tanh':
+            z1 = torch.tanh(z1)
         z1 = z1.reshape(-1, 1)
-        if args.infstyle == 'circshift':
-            z1 = circshift_z_nodemode(z1, num_nodes, 1)
 
-        out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
-        loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+        #Poisson Loss
+        if with_hd_input:
+            if args.reconstruction:
+                out_p1, _ = decoder(x_spk, ang, edge_idx, z1, pref_HD, True, pred_step_p1, msg_hop)
+                loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+
+            else:
+                out_p1, _ = decoder(x_spk, ang, edge_idx, z1, pref_HD, False, pred_step_p1, msg_hop)
+                loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+        
+        elif no_external_input:
+            if args.reconstruction:
+                out_p1 = decoder(x_spk, edge_idx, z1, True, pred_step_p1, msg_hop)
+                loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+
+            else:
+                out_p1 = decoder(x_spk, edge_idx, z1, False, pred_step_p1, msg_hop)
+                loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+
         loss_recon_p1.backward()
         optimizer.step()
 
         poisson_p1_train.append(loss_recon_p1.item())
         
     scheduler.step()
-
     poisson_p1_valid = []
-    z_loss_valid = []
 
     adj_inf_model.eval()
     decoder.eval()
     
     with torch.no_grad():
         for _, data in enumerate(valid_loader):
-            x_spk, tar_spk, edge_idx = data
-            x_spk, tar_spk, edge_idx = x_spk.squeeze(), tar_spk.squeeze(), edge_idx.squeeze()
-            x_spk, tar_spk, edge_idx = x_spk.to(device), tar_spk.to(device), edge_idx.to(device)
+            if args.dataset == 'neural_spike':
+                x_spk, tar_spk = data
+                x_spk, tar_spk = x_spk.to(device), tar_spk.to(device)
+                edge_idx = edge_idx.to(device)
+
+            elif args.dataset == 'mouse_head_direction':
+                x_spk, tar_spk, ang = data
+                x_spk, tar_spk, ang = x_spk.to(device), tar_spk.to(device), ang.to(device)
+                edge_idx, pref_HD = edge_idx.to(device), pref_HD.to(device)
+            
+            else:
+                assert False, 'Invalid dataset, Try neural_spike or mouse_head_direction'
+
+            tar_spk = tar_spk.transpose(0, 1)
             
             optimizer.zero_grad()
 
-            if args.adj_infstyle == 'complete':
-                _, z1_corr = adj_inf_model(gts_input, edge_idx)
-                z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
-            elif args.adj_infstyle == 'circshift':
-                _, z1_corr = adj_inf_model(gts_input, edge_cs)
+            _, z1_corr = adj_inf_model(gts_input, edge_idx)
+            if args.if_symmode:
+                edge_idx, z1 = make_z_sym_gts(z1_corr, edge_idx, num_nodes, args.symmode)
             else:
-                assert False, 'Try complete/cicrshift for adj_infstyle'
+                z1 = z1_corr
 
-            z1 = -torch.sigmoid(z1_corr)
+            if args.z_act == 'sigmoid':
+                z1 = -torch.sigmoid(z1_corr)
+            elif args.z_act == 'tanh':
+                z1 = torch.tanh(z1_corr)
             z1 = z1.reshape(-1, 1)
-            if args.infstyle == 'circshift':
-                z1 = circshift_z_nodemode(z1, num_nodes, 1)
 
-            out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
-            loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+            if with_hd_input:
+                if args.reconstruction:
+                    out_p1, _ = decoder(x_spk, ang, edge_idx, z1, pref_HD, True, pred_step_p1, msg_hop)
+                    loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+
+                else:
+                    out_p1, _ = decoder(x_spk, ang, edge_idx, z1, pref_HD, False, pred_step_p1, msg_hop)
+                    loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+            
+            elif no_external_input:
+                if args.reconstruction:
+                    out_p1 = decoder(x_spk, edge_idx, z1, True, pred_step_p1, msg_hop)
+                    loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
+
+                else:
+                    out_p1 = decoder(x_spk, edge_idx, z1, False, pred_step_p1, msg_hop)
+                    loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
 
             poisson_p1_valid.append(loss_recon_p1.item())
+
+        z_item = z1.clone().cpu().detach().numpy()
         
         print('Epoch: {:04d}'.format(epoch),
               'pois_p1_train: {:.10f}'.format(np.mean(poisson_p1_train)),
@@ -518,7 +476,7 @@ def train_eq_only(epoch, best_val_loss):
             log.flush()
         
         loss = np.array([np.mean(poisson_p1_train), np.mean(poisson_p1_valid)])
-    return np.mean(poisson_p1_valid), loss
+    return np.mean(poisson_p1_valid), loss, z_item
 
 def train_perturb_target(epoch, best_val_p1, best_val_p2):
     t = time.time()
@@ -562,12 +520,12 @@ def train_perturb_target(epoch, best_val_p1, best_val_p2):
 
         optimizer.zero_grad()
 
-        _, z1_corr = adj_inf_model(gts_input, edge_idx)
+        hidden_enc, z1_corr = adj_inf_model(gts_input, edge_idx)
         z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
         z1 = -torch.sigmoid(z1_corr)
         z1 = z1.reshape(-1, 1)
 
-        out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
+        out_p1 = decoder(x_spk, edge_idx, z1, hidden_enc, pred_step_p1)
         loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
 
         _, z2_corr = adj_inf_model(per_input, edge_idx)
@@ -613,12 +571,12 @@ def train_perturb_target(epoch, best_val_p1, best_val_p2):
             
             optimizer.zero_grad()
 
-            _, z1_corr = adj_inf_model(gts_input, edge_idx)
+            hidden_enc, z1_corr = adj_inf_model(gts_input, edge_idx)
             z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
             z1 = -torch.sigmoid(z1_corr)
             z1 = z1.reshape(-1, 1)
 
-            out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
+            out_p1 = decoder(x_spk, edge_idx, z1, hidden_enc, pred_step_p1)
             loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
 
             _, z2_corr = adj_inf_model(per_input, edge_idx)
@@ -678,39 +636,20 @@ def train_perturb_target(epoch, best_val_p1, best_val_p2):
                          np.mean(poisson_p1_valid), np.mean(poisson_p2_valid), np.mean(z_loss_valid)])
     return np.mean(poisson_p1_valid), np.mean(poisson_p2_valid), loss
 
-
-
+z_list = []
 loss_list = []
 best_val_loss = np.inf
 best_val_p1, best_val_p2 = np.inf, np.inf
 best_epoch = 0
 
-if args.experiment == 'perturbation':
-    for epoch in tqdm(range(epochs)):
-        poiss_p1_val, loss = train_perturb(epoch, best_val_loss)
-        loss_list.append(loss)
-        if poiss_p1_val < best_val_loss:
-            best_val_loss = poiss_p1_val
-            best_epoch = epoch
-
-elif (args.experiment == 'equilibrium') or (args.experiment == 'perturb_target_only'):
-    for epoch in tqdm(range(epochs)):
-        poiss_p1_val, loss = train_eq_only(epoch, best_val_loss)
-        loss_list.append(loss)
-        if poiss_p1_val < best_val_loss:
-            best_val_loss = poiss_p1_val
-            best_epoch = epoch
-
-elif args.experiment == 'perturb_target':
-    for epoch in tqdm(range(epochs)):
-        poiss_p1_val, poiss_p2_val, loss = train_perturb_target(epoch, best_val_p1, best_val_p2)
-        loss_list.append(loss)
-        if poiss_p1_val < best_val_p1:
-            best_val_p1 = poiss_p1_val
-        if poiss_p2_val < best_val_p2:
-            best_val_p2 = poiss_p2_val
-            
-else:
-    assert False, 'Invalid Experiment'
+for epoch in tqdm(range(epochs)):
+    poiss_p1_val, loss, z = train_eq_only(epoch, best_val_loss)
+    loss_list.append(loss)
+    z_list.append(z)
+    if poiss_p1_val < best_val_loss:
+        best_val_loss = poiss_p1_val
+        best_epoch = epoch
 
 np.save(loss_file, np.stack(loss_list, axis=0))
+np.save(z_file, np.stack(z_list, axis=0))
+write_exp_log(file=exp_log_file, args=args)
