@@ -10,7 +10,6 @@ data/
 fig/
 SourceModified/__pycache__
 SourceModified/.vscode
-baselines/
 model/__pycache__
 model/glm
 model/mouse_hd
