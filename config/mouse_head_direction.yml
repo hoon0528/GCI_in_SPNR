@@ -1,0 +1,13 @@
+experiment:
+  num_nodes: 19 # should change on modules
+  tr_length: 169662
+
+training:
+  lr: 0.0005
+  lr_decay: 200
+  gamma: 0.5
+
+model:
+  znorm: 'sigmoid'
+  symmode: 'ltmatonly' # to make graph undirected(symmetric), {ltmatonly: use values of LT only, transpose: (A + AT / 2)}
+
